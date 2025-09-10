@@ -11,8 +11,9 @@ Suggested usage:
    . install_dir/setenv.sh
    ```
 
-2. Run the CNV callers. First create config files, set paths to listed dependencies
+2. Run the CNV callers
    ```
+   # Create a config file, edit it, then run the pipeline
    run-clamms +sampleconf > run-clamms.conf
    # edit run-clamms.conf
    run-clamms +config run-clamms.conf -o out.clamms -b ref/bam-sample-sex.txt
