@@ -2,7 +2,7 @@ This is a CNV pipeline for calling from exome data.
 
 Suggested usage:
 
-1. Install dependencies from github (this pipeline, vr-runner)
+1. Install dependencies from github (this pipeline, vr-runner, CoNVex, samtools, annot-tsv)
 
 
 2. xxxxxxxxxxxxxxxxxxxxx
