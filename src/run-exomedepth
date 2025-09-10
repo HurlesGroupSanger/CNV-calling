@@ -1,0 +1,348 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}     = 1;
+    $$self{rscript}     = 'Rscript';
+    $$self{samtools}    = 'samtools';
+    $$self{fa_ref}      = 'ref.fa';
+    $$self{baits}       = 'baits.txt';
+    $$self{nbatch}      = 100;
+    $$self{_sampleconf} = q[
+
+        # ExomeDepth can be installed with
+        #   if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+        #   BiocManager::install("ExomeDepth")
+        #
+        # Documentation and relevant papers
+        #   https://cran.r-project.org/web/packages/ExomeDepth/vignettes/ExomeDepth-vignette.pdf
+        #   https://www.nature.com/articles/s41598-021-93878-2
+        #   https://academic.oup.com/bioinformatics/article/28/21/2747/236565
+
+        rscript  => ']. $$self{rscript} .q[',
+        samtools => ']. $$self{samtools} .q[',
+
+        # Reference sequence
+        fa_ref   => ']. $$self{fa_ref} .q[',
+
+        # Bait regions
+        baits    => ']. $$self{baits} .q[',
+
+        # Number of samples per batch
+        nbatch   => ]. $$self{nbatch} .q[,
+
+        # Uncomment if default farm limits are exceeded
+        # limits  => { memory=>3_500, runtime=>5*60 },
+
+    ]."\n";
+
+    $$self{usage} .=
+        "About: Run the ExomeDepth pipeline\n" .
+        "Usage: run-exomedepth\n" .
+        "Options:\n" .
+        "   -b, --bam-sample-sex <file>     File with the list of bam\\tsex\n" .
+        "   -o, --outdir <dir>              Output directory\n" .
+        "   -r, --bait-regions <file>       BED file with bait regions\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-b' or $arg eq '--bam-sample-sex' ) { $$self{bam_sample_sex}=shift(@ARGV); next; }
+        if ( $arg eq '-r' or $arg eq '--bait-regions' ) { $$self{baits}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( !exists($$self{bam_sample_sex}) ) { $self->throw("Expected the -b option."); }
+    if ( !exists($$self{baits}) ) { $self->throw("Expected the -r option."); }
+
+    $self->set_temp_dir($$self{outdir});
+    $$self{targets} = "$$self{outdir}/targets.txt";
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    my ($jobs,$batches) = $self->read_jobs();
+
+    # prepare targets, ExomeDepth would like to have chr,beg,end,gene but we only have chr,beg,end
+    my $cmd =
+        qq[zless $$self{baits} | awk '{printf "%s\\t%s\\t%s\\t%s_%s_%s\\n",\$1,\$2,\$3,\$1,\$2,\$3}' > $$self{targets}.part && ] .
+        qq[ mv $$self{targets}.part $$self{targets}];
+    $self->spawn('run_cmd',$$self{targets},$cmd);
+    $self->wait;
+
+    for my $job (@$jobs)
+    {
+        my $cmd = qq[$$self{samtools} bedcov -c $$self{baits} $$job{aln} | cut -f1-3,5 | gzip -c > $$job{bedcov}.part && mv $$job{bedcov}.part $$job{bedcov}];
+        $self->spawn('run_cmd',$$job{bedcov},$cmd);
+    }
+    $self->wait;
+
+    for (my $i=0; $i<@$batches; $i++)
+    {
+        for (my $j=0; $j<@{$$batches[$i]}; $j++)
+        {
+            my $job = $$batches[$i][$j];
+            $$job{cnvs} = "$$self{outdir}/cnvs/$$job{bname}.txt.gz";
+            $self->spawn('call_cnvs',$$job{cnvs},$j,$$batches[$i]);
+        }
+    }
+    $self->wait;
+
+    $self->spawn('merge_cnvs',"$$self{outdir}/cnvs.txt.gz",$jobs);
+    $self->wait;
+
+    $self->clean($$self{outdir});
+    $self->all_done;
+}
+sub clean
+{
+    my ($self,$outdir) = @_;
+    $self->SUPER::clean($outdir);
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+
+sub unique_name
+{
+    my ($self,$names,$fname) = @_;
+    if ( !($fname=~m{([^/]+)\.[^\.]+$}) ) { $self->throw("Could not parse: $fname"); }
+    my $name = $1;
+    if ( exists($$names{$name}) ) { $self->throw("improve me: the basenames are not unique: $name\n"); }
+    $$names{$name} = $fname;
+    return $name;
+}
+
+# Returns a list of hashes with the following keys:
+#   - aln       .. full path to the alignment file (from the file provided via -b)
+#   - bname     .. bam file base name
+#   - sample    .. sample name
+#   - sex
+#   - bedcov    .. outdir/bedcov/bname.gz
+#
+# Make sure the batches are unisex, so that calling works for sex chromosomes as well
+#
+sub read_jobs
+{
+    my ($self) = @_;
+
+    if ( !$self->is_finished("$$self{outdir}/jobs.txt") )
+    {
+        my $bnames = {};
+        my %jobs = ();
+        open(my $fh,'<',$$self{bam_sample_sex}) or $self->throw("$$self{bam_sample_sex}: $!");
+        while (my $line=<$fh>)
+        {
+            chomp($line);
+            my ($aln,$smpl,$sex) = split(/\s+/,$line);
+            my $bname = $self->unique_name($bnames,$aln);
+            push @{$jobs{$sex}},
+            {
+                aln     => $aln,
+                bname   => $bname,
+                sample  => $smpl,
+                sex     => $sex,
+                bedcov  => "$$self{outdir}/bedcov/$bname.gz",
+            };
+        }
+        close($fh) or $self->throw("close failed: $$self{bam_sample_sex}");
+
+        my @batches;
+        for my $sex (keys %jobs)
+        {
+            my @jobs = @{$jobs{$sex}};
+            for (my $i=0; $i<@jobs; $i+=$$self{nbatch})
+            {
+                my $iend = $i + $$self{nbatch} - 1;
+                if ( $iend >= @jobs ) { $iend = scalar @jobs - 1; }
+                if ( $iend < $i ) { last; }
+                if ( $i>0 && $iend - $i + 1 < $$self{nbatch}*0.5 )
+                {
+                    # make sure the last bin is not too small, let make it contain at least half of the requested count
+                    push @{$batches[-1]},@jobs[$i..$iend];
+                }
+                else
+                {
+                    push @batches,[@jobs[$i..$iend]];
+                }
+            }
+        }
+        open($fh,'>',"$$self{outdir}/jobs.txt.part") or $self->throw("$$self{outdir}/jobs.txt.part: $!");
+        for (my $i=0; $i<@batches; $i++)
+        {
+            my $batch = $batches[$i];
+            for my $job (@$batch)
+            {
+                print $fh join("\t",$i,$$job{sex},$$job{sample},$$job{bname},$$job{aln},$$job{bedcov})."\n";
+            }
+        }
+        close($fh) or $self->throw("close failed: $$self{outdir}/jobs.txt.part");
+
+        for my $batch (@batches)
+        {
+            if ( @$batch < 6 )  { $self->throw("Some of the batches have too few samples: ".(scalar @$batch)." .. $$self{outdir}/jobs.txt.part\n"); }
+        }
+        rename("$$self{outdir}/jobs.txt.part","$$self{outdir}/jobs.txt") or $self->throw("rename $$self{outdir}/jobs.txt.part $$self{outdir}/jobs.txt: $!");
+    }
+
+    my @all_jobs = ();
+    my @batches = ();
+    open(my $fh,'<',"$$self{outdir}/jobs.txt") or $self->throw("$$self{outdir}/jobs.txt: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my ($i,$sex,$smpl,$bname,$aln,$bedcov) = split(/\t/,$line);
+        my $job = { sex=>$sex, sample=>$smpl, bname=>$bname, aln=>$aln, bedcov=>$bedcov };
+        push @all_jobs,$job;
+        push @{$batches[$i]},$job;
+        $$self{bname2sex}{$bname} = $sex;
+        $$self{bam2bname}{$aln} = $bname;
+    }
+    close($fh) or $self->throw("close failed: $$self{outdir}/jobs.txt");
+
+    return (\@all_jobs,\@batches);
+}
+
+sub run_rcode
+{
+    my ($self,$script,$code) = @_;
+    open(my $fh,'>',$script) or $self->throw("$script: $!");
+    print $fh qq[
+        $code
+    \n];
+    close($fh) or $self->throw("close failed: $script");
+    $self->cmd(qq[$$self{rscript} $script]);
+}
+
+sub call_cnvs
+{
+    my ($self,$outfile,$ismpl,$batch) = @_;
+    my @bedcov = ( $$batch[$ismpl]{bedcov} );
+    my @names  = ( $$batch[$ismpl]{bname} );
+    for (my $i=0; $i<@$batch; $i++)
+    {
+        if ( $i==$ismpl ) { next; }
+        push @bedcov,$$batch[$i]{bedcov};
+        push @names,$$batch[$i]{bname};
+    }
+    my $bedcov = join("',\n'",@bedcov);
+    my $names  = join("','",@names);
+    $self->run_rcode("$outfile.r",qq[
+        library(ExomeDepth)
+        names <- c('chromosome','start','end','$names')
+        files <- c('$bedcov')
+        exomes <- read.table(files[1])
+        for (i in 2:length(files))
+        {
+            x <- read.table(files[i])
+            if ( !identical(exomes[,1],x[,1]) ) stop(paste('Different regions? ',files[0],files[1]))
+            if ( !identical(exomes[,2],x[,2]) ) stop(paste('Different regions? ',files[0],files[1]))
+            if ( !identical(exomes[,3],x[,3]) ) stop(paste('Different regions? ',files[0],files[1]))
+            exomes <- cbind(exomes,x[,4])
+        }
+        colnames(exomes) <- names
+        targets <- as(exomes[,1:3],'data.frame')
+        colnames(targets) <- c('chromosome','start','end')
+        my.test <- exomes[,4]
+        ref.set <- as.matrix(exomes[,5:ncol(exomes)])
+        my.choice <- select.reference.set(
+            test.counts = my.test,
+            reference.counts = ref.set,
+            bin.length = (targets\$end - targets\$start)/1000,
+            n.bins.reduced = 10000)
+        my.matrix <- as.matrix(exomes[, my.choice\$reference.choice, drop = FALSE])
+        my.ref <- apply(X = my.matrix, MAR = 1, FUN = sum)
+        callset <- new(
+            'ExomeDepth',
+            test = my.test,
+            reference = my.ref,
+            formula = 'cbind(test, reference) ~ 1')
+        callset <- CallCNVs(x = callset,
+            transition.probability = 10^-4,
+            chromosome = targets\$chromosome,
+            start = targets\$start,
+            end = targets\$end,
+            name = targets\$start)
+        write.table(callset\@CNV.calls,file=gzfile('$outfile.part'),sep="\\t",row.names=FALSE,quote=FALSE)
+    ]);
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub merge_cnvs
+{
+    my ($self,$outfile,$jobs) = @_;
+    open(my $txt,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $txt "#".join("\t",qw(chr beg end sample type qual))."\n";
+    for my $job (@$jobs)
+    {
+        open(my $in,"gunzip -c $$job{cnvs} |") or $self->throw("gunzip -c $$job{cnvs}: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^start/ )
+            {
+                # eat the header: start.p end.p   type    nexons  start   end     chromosome      id      BF      reads.expected  reads.observed  reads.ratio
+                next;
+            }
+
+            # chr,beg,end,sample,type,q_some
+            my @val = split(/\t/,$line);
+            chomp($val[-1]);
+            my $type = $val[2] eq 'deletion' ? 'DEL' : 'DUP';
+            print $txt join("\t",$val[6],$val[4],$val[5],$$job{sample},$type,$val[8])."\n";
+        }
+        close($in) or $self->throw("close failed: $$self{outdir}/clamms/$$job{bname}/cnv.bed");
+    }
+    close($txt) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
