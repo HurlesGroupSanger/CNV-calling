@@ -1,0 +1,97 @@
+How to run the CLAMMS pipeline
+------------------------------
+
+1) Install the runner framework
+
+    # Set DIR to your installation directory, here it assumes your home directory
+    DIR=$HOME
+
+    cd $DIR
+    git clone git://github.com/VertebrateResequencing/vr-runner.git
+    export PERL5LIB="$DIR/vr-runner/modules:$PERL5LIB"
+    export $PATH="$DIR/vr-runner/scripts:$PATH"
+
+    # Test if paths were set correctly
+    run-clamms -h
+
+    # There are a number of default paths to files and executables in the pipeline.
+    # They can be overriden by providing a config file:
+    run-clamms +sampleconf > clamms.conf
+
+    # After editing the config file, provide the +config parameter to the pipeline,
+    # in addition to the options described below
+    run-clamms +config clamms.conf ...
+
+
+
+2) How to run runner pipelines in general.
+
+   Best is to use the `screen` command:
+
+        # Open a new persistent screen called "clamms". The "-S clamms" part is
+        # not required, but helps when multiple screens are left in background.
+        screen -S clamms
+
+        # Do some terminal action here
+        ...
+
+        # Now detach from the screen, leaving the terminal magically active in the background
+        Press `CTRL+a' then press `d'
+
+        # Later, attach back to this screen using
+        screen -r
+
+        # If multiple screens are running, choose the desired one by providing the name
+        screen -r clamms
+
+
+   Documentation to the runner framework can be found here
+        https://github.com/VertebrateResequencing/vr-runner/
+
+
+
+3) How to run the run-clamms pipeline
+
+        run-clamms -o outdir/ -b bam-sex.txt -r exome_regions.txt +loop 300 +maxjobs 300 +mail pd3
+
+   The meaning of the options:
+
+        -o outdir
+            .. all the outputs will be placed here
+
+        -b bam-sex.txt
+            .. list of BAMs and sexes, for example
+                    /path/to/data/20150220/866STD86.bam M
+                    /path/to/data/20150220/866STD88.bam F
+
+               Note that the pipeline will create stats file (picard and samtools/stats) and place
+               them into
+                    /path/to/file.bam.hs_metrics
+                    /path/to/file.bam.stats
+
+               If this is not desired because of permissions, just symlink the BAMs somwhere
+               else and provide the symlink paths instead.
+
+        -r exome_regions.txt
+            .. the bait regions
+
+        +loop 300
+            .. tell the pipeline to check periodically (every 5 minutes) the running jobs.
+               If the option is not given, the pipeline checks the running jobs, spawns
+               new jobs if necessary and exists. In this mode it can be run from crontab.
+
+        +maxjobs 300
+            .. to make things faster, don't spawn more jobs than this at once
+
+        +mail pd3
+            .. if the pipeline finishes or something goes wrong, email this user
+
+
+
+4) Troubleshooting
+
+    - When the data is too noisy, CLAMMS would call too many CNVs. If that happens, it aborts complaining that
+      too many CNVs (>4096) have been found. In such case, the pipeline creates a list of failed samples
+      in "$OUTPUT_DIR/failed.txt".
+
+

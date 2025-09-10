@@ -1,0 +1,392 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+# XHMM documentation
+#    https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4065038/
+#    https://zzz.bwh.harvard.edu/xhmm/tutorial.shtml
+#    https://zzz.bwh.harvard.edu/xhmm/download.shtml
+#
+
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}     = 1;
+    $$self{gatk}        = 'java -Xms3000m -Xmx3000m -jar GenomeAnalysisTK.jar';
+    $$self{picard}      = 'java -Xms3000m -Xmx3000m -jar picard-3.0.0.jar';
+    $$self{xhmm}        = 'xhmm';
+    $$self{xhmm_params} = 'params.txt';
+    $$self{xhmm_r}      = 'R_functions';
+    $$self{rscript}     = 'Rscript';
+    $$self{fa_ref}      = 'ref.fa';
+    $$self{baits}       = 'baits.txt';
+    $$self{nbatch}      = 100;
+    $$self{_sampleconf} = q[
+
+        gatk     => ']. $$self{gatk} .q[',
+        picard   => ']. $$self{picard} .q[',
+        xhmm     => ']. $$self{xhmm} .q[',
+        xhmm_r   => ']. $$self{xhmm_r} .q[',
+        xhmm_params => ']. $$self{xhmm_params} .q[',
+
+        # Reference sequence
+        fa_ref   => ']. $$self{fa_ref} .q[',
+
+        # Bait regions
+        baits    => ']. $$self{baits} .q[',
+
+        # Number of samples per batch
+        nbatch   => ]. $$self{nbatch} .q[,
+
+        # Uncomment if default farm limits are exceeded
+        gatk_depth_limits  => { memory=>3_500, runtime=>5*60 },
+        #merge_depth_limits => { memory=>3_500, runtime=>5*60 },
+
+    ]."\n";
+
+    $$self{usage} .=
+        "About: Run the XHMM pipeline\n" .
+        "Usage: run-xhmm\n" .
+        "Options:\n" .
+        "   -b, --bam-sex <file>        File with the list of bam\\tsex\n" .
+        "   -o, --outdir <dir>          Output directory\n" .
+        "   -r, --bait-regions <file>   BED file with bait regions\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-b' or $arg eq '--bam-sex' ) { $$self{bam_sex}=shift(@ARGV); next; }
+        if ( $arg eq '-r' or $arg eq '--bait-regions' ) { $$self{baits}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( !exists($$self{bam_sex}) ) { $self->throw("Expected the -b option."); }
+    if ( !exists($$self{baits}) ) { $self->throw("Expected the -r option."); }
+
+    $self->set_temp_dir($$self{outdir});
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    my ($jobs,$batches) = $self->read_jobs();
+
+    # Run `gatk -T AnnotateIntervals` to get GC content, convert to the expected format (chr:beg-end\tgc),
+    # and extract tragets with extreme GC
+    my $outfile = "$$self{outdir}/gc.txt";
+    my $cmd =
+        qq[cp $$self{baits} $$self{outdir}/baits.bed] .
+        qq[ && $$self{gatk} AnnotateIntervals -L $$self{outdir}/baits.bed -R $$self{fa_ref} -imr OVERLAPPING_ONLY -O $outfile.part] .
+        qq[ && cat $outfile.part | grep -v ^@ | tail -n +2 | awk '{printf "%s:%s-%s\\t%s\\n",\$1,\$2,\$3,\$4}' > $outfile.partx] .
+        qq[ && cat $outfile.partx | awk '{if (\$2 < 0.1 || \$2 > 0.9) print \$1}' > $$self{outdir}/baits.extreme-gc.txt] .
+        qq[ && mv $outfile.partx $outfile] .
+        qq[ && rm -f $outfile.part];
+    $self->spawn('run_cmd',$outfile,$cmd);
+    $self->wait;
+
+    # Optional step, unfinished in this pipeline
+    #   $cmd =
+    #       qq[$$self{pseq} $$self{outdir} loc-intersect --group refseq --locdb /path/to/locdb --file ./EXOME.interval_list --out ./annotated_targets.refseq
+    #      pseq . loc-stats --locdb ./EXOME.targets.LOCDB --group targets --seqdb ./seqdb | \
+    #      awk '{if (NR > 1) print $_}' | sort -k1 -g | awk '{print $10}' | paste ./EXOME.interval_list - | \
+    #      awk '{print $1"\t"$2}' \
+    #      > ./DATA.locus_complexity.txt
+    #
+    #      cat ./DATA.locus_complexity.txt | awk '{if ($2 > 0.25) print $1}' \
+    #      > ./low_complexity_targets.txt
+
+    # Format bait regions as GATK's intervals, note the file name suffix is important (GATK 4.2.1.0)
+    $cmd =
+        qq[$$self{picard} BedToIntervalList -I $$self{baits} -SD $$self{fa_ref} -O $$self{outdir}/baits.txt.interval_list.part &&] .
+        qq[ mv $$self{outdir}/baits.txt.interval_list.part $$self{outdir}/baits.txt.interval_list];
+    $self->spawn('run_cmd',"$$self{outdir}/baits.txt.interval_list",$cmd);
+    $self->wait;
+
+    # run GATK's depth of coverage
+    my %limits = $self->get_limits;
+    $self->set_limits(%{$$self{gatk_depth_limits}}) unless !exists($$self{gatk_depth_limits});
+    for my $job (@$jobs)
+    {
+        my $outfile = $$job{depth};
+        my $cmd =
+            qq[$$self{gatk} DepthOfCoverage -L $$self{outdir}/baits.txt.interval_list -R $$self{fa_ref} -I $$job{aln}] .
+            qq[ --max-depth-per-sample 5000 --omit-depth-output-at-each-base true --omit-locus-table true] .
+            qq[ --min-base-quality 20 --start 1 --stop 500 --nBins 200] .
+            qq[ --include-ref-n-sites true -imr OVERLAPPING_ONLY] .
+            qq[ --count-type COUNT_READS] .
+            qq[ --output-format TABLE] .
+            qq[ -O $outfile];
+        $self->spawn('run_cmd',$outfile,qq[$cmd && mv $outfile.sample_interval_summary $outfile]);
+    }
+    $self->wait;
+    $self->reset_limits(%limits);
+
+    for (my $i=0; $i<@$batches; $i++)
+    {
+        $self->spawn('run_xhmm_batch',"$$self{outdir}/batch.done/$i","$$self{outdir}/batch/$i",$$batches[$i]);
+    }
+    $self->wait;
+
+    $self->spawn('merge_batches',"$$self{outdir}/xhmm.txt.gz",$batches);
+    $self->wait;
+
+    # $self->spawn('plot_hmm',"$$self{outdir}/plots.done");
+    # $self->wait;
+
+    $self->clean($$self{outdir});
+    $self->all_done;
+}
+sub clean
+{
+    my ($self,$outdir) = @_;
+    $self->SUPER::clean($outdir);
+}
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+
+sub unique_name
+{
+    my ($self,$names,$fname) = @_;
+    if ( !($fname=~m{([^/]+)\.[^\.]+$}) ) { $self->throw("Could not parse: $fname"); }
+    my $name = $1;
+    if ( exists($$names{$name}) ) { $self->throw("improve me: the basenames are not unique: $name\n"); }
+    $$names{$name} = $fname;
+    return $name;
+}
+
+# Returns a list of hashes with the following keys:
+#   - aln       .. full path to the alignment file (from the file provided via -b)
+#   - bname     .. bam file base name
+#   - sex
+#   - depth     .. outdir/depth/bname.depth
+#
+sub read_jobs
+{
+    my ($self) = @_;
+    my $bnames = {};
+    my @jobs = ();
+    open(my $fh,'<',$$self{bam_sex}) or $self->throw("$$self{bam_sex}: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my ($aln,$sex) = split(/\s+/,$line);
+        my $bname = $self->unique_name($bnames,$aln);
+        push @jobs,
+        {
+            aln     => $aln,
+            bname   => $bname,
+            sex     => $sex,
+            depth   => "$$self{outdir}/depth/$bname.depth",
+        };
+        $$self{bname2sex}{$bname} = $sex;
+        $$self{bam2bname}{$aln} = $bname;
+    }
+    close($fh) or $self->throw("close failed: $$self{bam_sex}");
+
+    my @batches = ();
+    for (my $i=0; $i<@jobs; $i+=$$self{nbatch})
+    {
+        my $iend = $i + $$self{nbatch} - 1;
+        if ( $iend >= @jobs ) { $iend = scalar @jobs - 1; }
+        if ( $iend < $i ) { last; }
+        if ( $i>0 && $iend - $i + 1 < $$self{nbatch}*0.5 )
+        {
+            # make sure the last bin is not too small, let make it contain at least half of the requested count
+            push @{$batches[-1]},@jobs[$i..$iend];
+        }
+        else
+        {
+            push @batches,[@jobs[$i..$iend]];
+        }
+    }
+    return (\@jobs,\@batches);
+}
+
+sub merge_gatk_depths
+{
+    my ($self,$outfile,$jobs) = @_;
+    open(my $fh,'>',"$outfile.list") or $self->throw("$outfile.list: $!");
+    for my $job (@$jobs)
+    {
+        print $fh $$job{depth}."\n";
+    }
+    close($fh) or $self->throw("close failed: $outfile.list");
+    $self->cmd(qq[$$self{xhmm} --mergeGATKdepths -o $outfile.part --GATKdepthsList=$outfile.list && mv $outfile.part $outfile]);
+}
+
+sub plot_hmm
+{
+    my ($self,$outfile) = @_;
+    $self->cmd(qq[mkdir -p $$self{outdir}/plots]);
+    open(my $fh,'>',"$$self{outdir}/plot.r") or $self->throw("$$self{outdir}/plot.r: $!");
+    print $fh qq[
+
+        XHMM_SCRIPTS_PATH = "$$self{xhmm_r}"
+        source(paste(XHMM_SCRIPTS_PATH, "/sourceDir.R", sep=""))
+        sourceDir(XHMM_SCRIPTS_PATH, trace = FALSE, recursive = TRUE)
+
+        library(gplots)
+        library(plotrix)
+
+        PLOT_PATH = "$$self{outdir}/plots"
+        JOB_PREFICES = "$$self{outdir}/DATA"
+        JOB_TARGETS_TO_GENES = NULL
+        SAMPLE_FEATURES = NULL
+
+        XHMM_plots(PLOT_PATH, JOB_PREFICES, JOB_TARGETS_TO_GENES, SAMPLE_FEATURES)
+    ];
+    close($fh) or $self->throw("close failed: $$self{outdir}/plot.r");
+    $self->cmd(qq[$$self{rscript} $$self{outdir}/plot.r && touch $outfile]);
+}
+
+sub run_xhmm_batch
+{
+    my ($self,$outfile,$dir,$jobs) = @_;
+
+    $self->cmd("mkdir -p $dir");
+    $self->merge_gatk_depths("$dir/DATA.RD.txt",$jobs);
+
+    # filter samples and targets and then mean-center the targets
+    my $cmd =
+        qq[$$self{xhmm} --matrix -r $dir/DATA.RD.txt] .
+        qq[ --centerData --centerType target] .
+        qq[ --outputMatrix=$dir/DATA.filtered_centered.RD.txt.part] .
+        qq[ --outputExcludedTargets $dir/DATA.filtered_centered.RD.txt.filtered_targets.txt] .
+        qq[ --outputExcludedSamples $dir/DATA.filtered_centered.RD.txt.filtered_samples.txt] .
+        qq[ --excludeTargets $$self{outdir}/baits.extreme-gc.txt] .      # todo: pseq to generate --excludeTargets ./low_complexity_targets.txt
+        qq[ --minTargetSize 10 --maxTargetSize 10000] .
+        qq[ --minMeanTargetRD 10 --maxMeanTargetRD 500] .
+        qq[ --minMeanSampleRD 25 --maxMeanSampleRD 200] .
+        qq[ --maxSdSampleRD 150] .
+        qq[ && mv $dir/DATA.filtered_centered.RD.txt.part $dir/DATA.filtered_centered.RD.txt];
+    $self->cmd($cmd);
+
+    # run PCA on mean-centered data and normalizes mean-centered data using PCA information
+    $cmd =
+        qq[$$self{xhmm} --PCA -r $dir/DATA.filtered_centered.RD.txt --PCAfiles $dir/DATA.RD_PCA && ] .
+        qq[$$self{xhmm} --normalize -r $dir/DATA.filtered_centered.RD.txt --PCAfiles $dir/DATA.RD_PCA] .
+        qq[ --PCnormalizeMethod PVE_mean --PVE_mean_factor 0.7] .
+        qq[ --normalizeOutput $dir/DATA.PCA_normalized.txt] .
+        qq[ && touch $dir/DATA.PCA_normalized.done];
+    $self->cmd($cmd);
+
+    # Filter and z-score center (by sample) the PCA-normalized data
+    $cmd =
+        qq[$$self{xhmm} --matrix -r $dir/DATA.PCA_normalized.txt --centerData --centerType sample --zScoreData] .
+        qq[ -o $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt ] .
+        qq[ --outputExcludedTargets $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt.filtered_targets.txt ] .
+        qq[ --outputExcludedSamples $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt.filtered_samples.txt ] .
+        qq[ --maxSdTargetRD 30 ] .
+        qq[ && touch $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.done];
+    $self->cmd($cmd);
+
+    # Filters original read-depth data to be the same as filtered, normalized data:
+    $cmd =
+        qq[$$self{xhmm} --matrix -r $dir/DATA.RD.txt] .
+        qq[ --excludeTargets $dir/DATA.filtered_centered.RD.txt.filtered_targets.txt] .
+        qq[ --excludeTargets $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt.filtered_targets.txt] .
+        qq[ --excludeSamples $dir/DATA.filtered_centered.RD.txt.filtered_samples.txt] .
+        qq[ --excludeSamples $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt.filtered_samples.txt] .
+        qq[ -o $dir/DATA.same_filtered.RD.txt] .
+        qq[ && touch $dir/DATA.same_filtered.RD.done];
+    $self->cmd($cmd);
+
+    # Discover CNVs in normalized data
+    $cmd =
+        qq[$$self{xhmm} --discover -p $$self{xhmm_params}] .
+        qq[ -r $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt] .
+        qq[ -R $dir/DATA.same_filtered.RD.txt] .
+        qq[ -c $dir/DATA.xcnv -a $dir/DATA.aux_xcnv -s $dir/DATA] .
+        qq[ && touch $dir/DATA.xcnv.done];
+    $self->cmd($cmd);
+
+    # Genotypes discovered CNVs in all samples:
+    $cmd =
+        qq[$$self{xhmm} --genotype -p $$self{xhmm_params}] .
+        qq[ -r $dir/DATA.PCA_normalized.filtered.sample_zscores.RD.txt -R $dir/DATA.same_filtered.RD.txt] .
+        qq[ -g $dir/DATA.xcnv -F $$self{fa_ref}] .
+        qq[ -v $dir/DATA.vcf.part] .
+        qq[ && mv $dir/DATA.vcf.part $dir/DATA.vcf];
+    $self->cmd($cmd);
+
+    $self->cmd("touch $outfile");
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub merge_batches
+{
+    my ($self,$outfile,$batches) = @_;
+    my $txtfile = "$$self{outdir}/cnvs.txt.gz";
+    open(my $txt,"| gzip -c > $txtfile") or $self->throw("gzip -c > $txtfile.oart: $!");
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $txt "#".join("\t",qw(chr beg end sample type qual))."\n";
+    for (my $i=0; $i<@$batches; $i++)
+    {
+        open(my $in,'<',"$$self{outdir}/batch/$i/DATA.xcnv") or $self->throw("$$self{outdir}/batch/$i/DATA.xcnv: $!");
+        my $hdr = <$in>;
+        if ( $i==0 ) { print $fh $hdr; }
+        while (my $line=<$in>)
+        {
+            print $fh $line;
+
+            # in:  SAMPLE,CNV,INTERVAL,KB,CHR,MID_BP,TARGETS,NUM_TARG,Q_EXACT,Q_SOME,Q_NON_DIPLOID,Q_START,Q_STOP,MEAN_RD,MEAN_ORIG_RD
+            # out: chr,beg,end,sample,type,q_some
+            my @val = split(/\t/,$line);
+            chomp($val[-1]);
+            if ( !($val[2]=~/^(.+):(\d+)-(\d+)$/) ) { $self->throw("Could not parse $$self{outdir}/batch/$i/DATA.xcnv: $line"); }
+            my $chr = $1;
+            my $beg = $2;
+            my $end = $3;
+            print $txt join("\t",$chr,$beg,$end,$val[0],$val[1],$val[9])."\n";
+        }
+        close($in) or $self->throw("close failed: $$self{outdir}/batch/$i/DATA.xcnv");
+    }
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile");
+}
+

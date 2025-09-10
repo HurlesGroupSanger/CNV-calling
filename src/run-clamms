@@ -1,0 +1,483 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+# to do: all resources must respect the targets ordering (gc.txt,canoes/108.part/reads)
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}     = 1;
+    $$self{samtools}    = 'samtools';
+    $$self{picard}      = 'java -Xms3000m -Xmx3000m -jar /picard.jar';
+    $$self{rscript}     = 'rscript';
+    $$self{isize}       = 200;
+    $$self{nref_smpl}   = 100;
+    $$self{clamms}      = 'clamms';
+    $$self{clamms_regs} = 'data/clamms_special_regions.hg19.bed';
+    $$self{fa_ref}      = 'hs37d5.fa';
+    $$self{baits}       = undef;
+    $$self{mappability} = 'clamms/ref/mappability.bed';
+    $$self{_sampleconf} = q[
+
+        samtools => ']. $$self{samtools} .q[',
+        picard   => ']. $$self{picard} .q[',
+        rscript  => ']. $$self{rscript} .q[',
+
+        # CLAMMS directory
+        clamms      => ']. $$self{clamms} .q[',
+        clamms_regs => ']. $$self{clamms_regs} .q[',
+
+        # reference sequence
+        fa_ref => ']. $$self{fa_ref} .q[',
+
+        # mappability, obtained as described here https://github.com/rgcgithub/clamms
+        mappability => ']. $$self{mappability} .q[',
+
+        # bait regions, can be also given via the -r command line option
+        baits => undef,
+
+        # number of samples in the reference panel
+        nref_smpl => ]. $$self{nref_smpl} .q[,
+
+        # make insert size slightly bigger, for example, use 200 if the mean is ~150bp
+        isize  => ]. $$self{isize} .q[,
+
+    ]."\n";
+
+    $$self{usage} .=
+        "About: Run the CLAMMS pipeline\n" .
+        "Usage: run-clamms\n" .
+        "Options:\n" .
+        "   -b, --bam-sample-sex <file>     File with the list of bam\\tsex\n" .
+        "   -o, --outdir <dir>              Output directory\n" .
+        "   -r, --bait-regions <file>       BED file with bait regions\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-b' or $arg eq '--bam-sample-sex' ) { $$self{bam_sample_sex}=shift(@ARGV); next; }
+        if ( $arg eq '-r' or $arg eq '--bait-regions' ) { $$self{baits}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( !exists($$self{bam_sample_sex}) ) { $self->throw("Expected the -b option."); }
+    if ( !exists($$self{baits}) ) { $self->throw("Expected the -r option."); }
+
+    if ( !($$self{baits}=~m{([^/]+$)}) ) { $self->throw("Could not parse the file name: $$self{baits}"); }
+    $$self{wins} = "$$self{outdir}/$1.wins";
+
+    $ENV{CLAMMS_DIR} = $$self{clamms};
+    $self->set_temp_dir($$self{outdir});
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    $self->fix_resource_chr_naming;
+
+    my $jobs = $self->read_jobs();
+
+    # Run picard BedToIntervalList and annotate_windows.sh
+    $self->spawn('make_intervals',"$$self{baits}.intervals",$$self{baits});
+    $self->spawn('make_windows',$$self{wins},$$self{baits});
+    $self->wait;
+
+    # Run picard `CollectHsMetrics`
+    $self->set_limits(memory=>3_000);
+    for my $job (@$jobs)
+    {
+        $self->spawn('hs_metrics',$$job{metrics},$job);
+    }
+    $self->wait;
+    $self->set_limits(memory=>undef);
+
+    # Run `samtools stats`
+    for my $job (@$jobs)
+    {
+        $self->spawn('samtools_stats',$$job{stats},$job);
+    }
+    $self->wait;
+
+    # Select reference panels using the k-d tree
+    $self->spawn('select_ref_panels',"$$self{outdir}/ref-panels",$jobs);
+    $self->wait;
+
+    # Run `samtools bedcov`
+    for my $job (@$jobs)
+    {
+        $self->spawn('coverage',$$job{bedcov},$job);
+    }
+    $self->wait;
+
+    for my $job (@$jobs)
+    {
+        $self->spawn('clamms',"$$self{outdir}/clamms/$$job{bname}",$job);
+    }
+    $self->wait;
+
+    $self->spawn('merge_cnvs',"$$self{outdir}/cnvs.bed.gz",$jobs);
+    $self->wait;
+
+    $self->all_done;
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+# clamms requires all resources to have the same chr naming convention and
+# the same order of chromosomes in the files
+sub fix_resource_chr_naming
+{
+    my ($self) = @_;
+
+    my $line = `head -1 $$self{fa_ref}`;
+    my $ref_has_chr = $line=~/^>chr/i ? 1 : 0;
+
+    $self->cmd(qq[mkdir -p $$self{outdir}/ref]);
+
+    if ( !$self->is_finished("$$self{outdir}/ref/targets.bed") )
+    {
+        $line = `head -1 $$self{baits}`;
+        my $has_chr = $line=~/^chr/i ? 1 : 0;
+        my $expr = '';
+        if ( $ref_has_chr != $has_chr )
+        {
+            $expr = $ref_has_chr ? 's,^,chr,' : 's,^chr,,';
+            $expr = qq[ | sed '$expr' ];
+        }
+        $self->cmd(qq[cat $$self{baits} $expr | sort -k1,1d -k2,2n -k3,3n > $$self{outdir}/ref/targets.bed.part && mv $$self{outdir}/ref/targets.bed.part $$self{outdir}/ref/targets.bed]);
+    }
+    $$self{baits} = "$$self{outdir}/ref/targets.bed";
+
+    if ( !$self->is_finished("$$self{outdir}/ref/mappability.bed") )
+    {
+        $line = `head -1 $$self{mappability}`;
+        my $has_chr = $line=~/^chr/i ? 1 : 0;
+        my $expr = '';
+        if ( $ref_has_chr != $has_chr )
+        {
+            $expr = $ref_has_chr ? 's,^,chr,' : 's,^chr,,';
+            $expr = qq[ | sed '$expr' ];
+        }
+        $self->cmd(qq[cat $$self{mappability} $expr | sort -k1,1d -k2,2n -k3,3n > $$self{outdir}/ref/mappability.bed.part && mv $$self{outdir}/ref/mappability.bed.part $$self{outdir}/ref/mappability.bed]);
+    }
+    $$self{mappability} = "$$self{outdir}/ref/mappability.bed";
+
+    if ( !$self->is_finished("$$self{outdir}/ref/clamms_regs.bed") )
+    {
+        $line = `head -1 $$self{clamms_regs}`;
+        my $has_chr = $line=~/^chr/i ? 1 : 0;
+        my $expr = '';
+        if ( $ref_has_chr != $has_chr )
+        {
+            $expr = $ref_has_chr ? 's,^,chr,' : 's,^chr,,';
+            $expr = qq[ | sed '$expr' ];
+        }
+        $self->cmd(qq[cat $$self{clamms_regs} $expr | sort -k1,1d -k2,2n -k3,3n > $$self{outdir}/ref/clamms_regs.bed.part && mv $$self{outdir}/ref/clamms_regs.bed.part $$self{outdir}/ref/clamms_regs.bed]);
+    }
+    $$self{clamms_regs} = "$$self{outdir}/ref/clamms_regs.bed";
+}
+
+sub unique_name
+{
+    my ($self,$names,$fname) = @_;
+    if ( !($fname=~m{([^/]+)\.[^\.]+$}) ) { $self->throw("Could not parse: $fname"); }
+    my $name = $1;
+    if ( exists($$names{$name}) ) { $self->throw("improve me: the basenames are not unique: $name\n"); }
+    $$names{$name} = $fname;
+    return $name;
+}
+
+# Returns a list of hashes with the following keys:
+#   - aln       .. full path to the alignment file (from the file provided via -b)
+#   - bname     .. bam file base name
+#   - sample    .. sample name
+#   - sex
+#   - stats     .. outdir/stats/bname.stats
+#   - metrics   .. outdir/metrics/bname.hs_metrics
+#   - bedcov    .. outdir/coverage/bname.bed
+#
+sub read_jobs
+{
+    my ($self) = @_;
+    my $bnames = {};
+    my @jobs = ();
+    open(my $fh,'<',$$self{bam_sample_sex}) or $self->throw("$$self{bam_sample_sex}: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my ($aln,$smpl,$sex) = split(/\s+/,$line);
+        my $bname = $self->unique_name($bnames,$aln);
+        push @jobs,
+        {
+            aln     => $aln,
+            bname   => $bname,
+            sample  => $smpl,
+            sex     => $sex,
+            stats   => "$$self{outdir}/stats/$bname.stats",
+            metrics => "$$self{outdir}/metrics/$bname.hs_metrics",
+            bedcov  => "$$self{outdir}/coverage/$bname.bed",
+        };
+        $$self{bname2sex}{$bname} = $sex;
+        $$self{bam2bname}{$aln}   = $bname;
+        $$self{bam2bedcov}{$aln}  = "$$self{outdir}/coverage/$bname.bed";
+    }
+    close($fh) or $self->throw("close failed: $$self{bam_sample_sex}");
+    return \@jobs;
+}
+sub make_intervals
+{
+    my ($self,$outfile,$baits) = @_;
+    $self->cmd(qq[$$self{picard} BedToIntervalList -I $$self{baits} -SD $$self{fa_ref} -O $outfile.part],java_err_file=>"$outfile.java_log");
+    unlink("$outfile.java_log");
+    unlink("$outfile.java_log.prev");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub make_windows
+{
+    my ($self,$outfile,$baits) = @_;
+    $self->cmd(qq[$$self{clamms}/annotate_windows.sh $baits $$self{fa_ref} $$self{mappability} $$self{isize} $$self{clamms_regs} | sed 's,chr,,g' > $outfile.part]);
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub coverage
+{
+    my ($self,$outfile,$job) = @_;
+    $self->cmd(qq[$$self{samtools} bedcov -Q 30 $$self{wins} $$job{aln} | awk '{printf "%s\\t%d\\t%d\\t%.6g\\n",\$1,\$2,\$3,\$NF/(\$3-\$2);}' > $outfile.raw]);
+    $self->cmd(qq[$$self{clamms}/normalize_coverage $outfile.raw $$self{wins} | sed 's,^chr,,' > $outfile.part]);
+    $self->cmd(qq[gzip $outfile.raw]);
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub hs_metrics
+{
+    my ($self,$outfile,$job) = @_;
+    $self->cmd(qq[$$self{picard} CollectHsMetrics -VALIDATION_STRINGENCY SILENT -R $$self{fa_ref} -I $$job{aln} -O $outfile.part -BI $$self{baits}.intervals -TI $$self{baits}.intervals],java_err_file=>"$outfile.java_log");
+    unlink("$outfile.java_log");
+    unlink("$outfile.java_log.prev");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub samtools_stats
+{
+    my ($self,$outfile,$job) = @_;
+    $self->cmd("$$self{samtools} stats $$job{aln} > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub merge_metrics
+{
+    my ($self,$outfile,$jobs) = @_;
+
+    if ( $self->is_finished($outfile) ) { return; }
+
+    my @cols = (qw(AT_DROPOUT GC_DROPOUT ON_BAIT_VS_SELECTED PCT_PF_UQ_READS PCT_TARGET_BASES_10X PCT_TARGET_BASES_50X MEAN_INSERT_SIZE));
+
+    open(my $out,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    print $out "#BAM\tBASE_NAME";
+    for my $name (@cols)
+    {
+        print $out "\t$name";
+    }
+    print $out "\n";
+
+    for my $job (@$jobs)
+    {
+        my %metrics = ();
+        open(my $in,'<',$$job{metrics}) or $self->throw("$$job{metrics}: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^## METRICS/ )
+            {
+                my $line1 = <$in>;
+                my $line2 = <$in>;
+                my @cols1 = split(/\t/,$line1);
+                my @cols2 = split(/\t/,$line2);
+                if ( scalar @cols1 != scalar @cols2 ) { $self->throw("incorrect number of columns in $$job{metrics}\n"); }
+                chomp($cols1[-1]);
+                chomp($cols2[-1]);
+                for (my $i=0; $i<@cols1; $i++) { $metrics{$cols1[$i]} = $cols2[$i]; }
+                last;
+            }
+        }
+        close($in);
+        open($in,'<',$$job{stats}) or $self->throw("$$job{stats}: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^SN\tinsert size average:\s+(\S+)/ ) { $metrics{'MEAN_INSERT_SIZE'} = $1; last; }
+        }
+        close($in);
+
+        print $out "$$job{aln}\t$$job{bname}";
+        for my $name (@cols)
+        {
+            if ( !exists($metrics{$name}) ) { $self->throw("The metric \"$name\" not found in $$job{metrics} or $$job{stats}\n"); }
+            print $out "\t$metrics{$name}";
+        }
+        print $out "\n";
+    }
+    close($out) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub select_ref_panels
+{
+    my ($self,$outdir,$jobs) = @_;
+
+    $self->merge_metrics("$$self{outdir}/merged_metrics.txt",$jobs);
+
+    open(my $fh,'>',"$$self{outdir}/ref-panels.r") or $self->throw("$$self{outdir}/ref-panels.r: $!");
+    print $fh qq[
+        # This code requires the FNN (Fast Nearest Neighbors) R package (http://cran.r-project.org/package=FNN)
+        require(FNN)
+
+        dat <- read.table('$$self{outdir}/merged_metrics.txt',header=TRUE,sep="\t",comment="")
+
+        # Create a scaled copy of the data frame
+        dat.scaled <- dat
+        drop <- c()
+        for (i in 3:ncol(dat.scaled))
+        {
+            mini <- min(dat.scaled[,i])
+            maxi <- max(dat.scaled[,i])
+            dat.scaled[,i] <- apply(dat.scaled, 1, function(row) { row[[i]] <- (as.numeric(row[[i]]) - mini) / (maxi - mini) })
+            if ( mini==maxi ) drop = c(drop, i)
+        }
+        if ( length(drop)!=0 )
+            dat.scaled <- subset(dat.scaled, select=-drop)
+
+        # Get k-nearest neighbors for each sample
+        k.param <- $$self{nref_smpl}
+        knns <- get.knn(dat.scaled[,c(seq(3,ncol(dat.scaled)))],k=k.param,algorithm="kd_tree")
+
+        # Generate a single file for each sample listing its k-nearest neighbor sample IDs
+        for (i in 1:nrow(dat.scaled))
+        {
+            fname <- paste("$outdir.part/",dat[i,2], ".txt", sep="")
+            nn.sampleids <- dat.scaled[ knns\$nn.index[i,], 1 ]
+            write.table(nn.sampleids, fname, quote=F, row.names=F, col.names=F)
+        }
+    ];
+    close($fh) or $self->throw("close failed: $$self{outdir}/ref-panels.r");
+
+    $self->cmd("mkdir -p $outdir.part");
+    $self->cmd("$$self{rscript} $$self{outdir}/ref-panels.r");
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub clamms
+{
+    my ($self,$outdir,$job) = @_;
+
+    $self->cmd("mkdir -p $outdir.part");
+
+    # add gender to the reference panel
+    open(my $in,'<',"$$self{outdir}/ref-panels/$$job{bname}.txt") or $self->throw("$$self{outdir}/ref-panels/$$job{bname}.txt: $!");
+    open(my $out,'>',"$outdir.part/ref-panel.txt") or $self->throw("$outdir.part/ref-panel.txt");
+    while (my $bam=<$in>)
+    {
+        chomp($bam);
+        if ( !exists($$self{bam2bname}{$bam}) or !defined($$self{bam2bname}{$bam}) ) { $self->throw("No information for $bam??\n"); }
+        my $bname = $$self{bam2bname}{$bam};
+        if ( !exists($$self{bname2sex}{$bname}) ) { $self->throw("No gender information for $bname??\n"); }
+        print $out "$$self{bam2bedcov}{$bam}\t$$self{bname2sex}{$bname}\n";
+    }
+    close($out) or $self->throw("close failed: $outdir.part/ref-panel.txt");
+    close($in) or $self->throw("close failed: $$self{outdir}/ref-panels/$$job{bname}.txt");
+
+    # note that clamms is unable to read 'chr1' naming convention and silently requires '1'
+    $self->cmd(qq[$$self{clamms}/fit_models $outdir.part/ref-panel.txt $$self{wins} | sed 's,^chr,,' > $outdir.part/models.bed]);
+    $self->cmd(qq[cat $$self{outdir}/coverage/$$job{bname}.bed | sed 's,^chr,,' > $outdir.part/$$job{bname}.bed]);
+    my ($cout,$cerr) = $self->cmd3(qq[$$self{clamms}/call_cnv $outdir.part/$$job{bname}.bed $outdir.part/models.bed --sex $$job{sex} > $outdir.part/cnv.bed],exit_on_error=>0);
+    if ( $? )
+    {
+        if ( !($$cerr[0] =~ /ERROR: more than 4096 CNVs detected/) ) { $self->throw("The command failed: ".join("\t",@$cout,@$cerr)); }
+        $self->cmd("touch $outdir.FAIL");
+    }
+
+    unlink("$outdir.part/$$job{bname}.bed");
+    unlink("$outdir.part/models.bed");
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub merge_cnvs
+{
+    my ($self,$outfile,$jobs) = @_;
+    if ( !($outfile=~/\.bed\.gz$/) ) { $self->throw("Uh, could not parse the filename: $outfile"); }
+    my $txtfile = $`.'.txt.gz';
+    my @failed = ();
+    open(my $txt,"| gzip -c > $txtfile") or $self->throw("gzip -c > $txtfile.part: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    my @hdr = (qw(chr beg end interval sample type CN nWins Q_SOME Q_EXACT Q_LEFT_EXTEND LEFT_EXTEND_COORD Q_RIGHT_EXTEND RIGHT_EXTEND_COORD Q_LEFT_CONTRACT LEFT_CONTRACT_COORD Q_RIGHT_CONTRACT RIGHT_CONTRACT_COORD));
+    print $out "#".join("\t",@hdr)."\n";
+    print $txt "#".join("\t",qw(chr beg end sample type qual))."\n";
+    for my $job (@$jobs)
+    {
+        if ( -e "$$self{outdir}/clamms/$$job{bname}.FAIL" )
+        {
+            push @failed,"$$job{bname}\t$$self{outdir}/clamms/$$job{bname}.FAIL\n";
+            next;
+        }
+        open(my $in,'<',"$$self{outdir}/clamms/$$job{bname}/cnv.bed") or $self->throw("$$self{outdir}/clamms/$$job{bname}/cnv.bed");
+        while (my $line=<$in>)
+        {
+            my @val = split(/\t/,$line);
+            chomp($val[-1]);
+            $val[4] = $$job{sample};
+            print $out join("\t",@val)."\n";
+
+            # chr,beg,end,sample,type,q_some
+            print $txt join("\t",$val[0],$val[1],$val[2],$$job{sample},$val[5],$val[8])."\n";
+        }
+        close($in) or $self->throw("close failed: $$self{outdir}/clamms/$$job{bname}/cnv.bed");
+    }
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+    close($txt) or $self->throw("close failed: gzip -c > $txtfile.part");
+
+    if ( @failed )
+    {
+        open($out,'>',"$$self{outdir}/failed.txt") or $self->throw("$$self{outdir}/failed.txt");
+        print $out join('',@failed);
+        close($out) or $self->throw("close failed: $$self{outdir}/failed.txt");
+    }
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
