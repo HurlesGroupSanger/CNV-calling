@@ -28,12 +28,12 @@ sub new
 
     $$self{verbose}     = 1;
     $$self{samtools}    = 'samtools';
-    $$self{picard}      = 'java -Xms3000m -Xmx3000m -jar /picard.jar';
+    $$self{picard}      = 'java -Xms3000m -Xmx3000m -jar picard.jar';
     $$self{rscript}     = 'rscript';
     $$self{isize}       = 200;
     $$self{nref_smpl}   = 100;
     $$self{clamms}      = 'clamms';
-    $$self{clamms_regs} = 'data/clamms_special_regions.hg19.bed';
+    $$self{clamms_regs} = 'clamms/data/clamms_special_regions.hg19.bed';
     $$self{fa_ref}      = 'hs37d5.fa';
     $$self{baits}       = undef;
     $$self{mappability} = 'clamms/ref/mappability.bed';
@@ -47,19 +47,30 @@ sub new
         clamms      => ']. $$self{clamms} .q[',
         clamms_regs => ']. $$self{clamms_regs} .q[',
 
-        # reference sequence
+        # File with the list of bam/cram,sample,sex(M/F), tab-separated
+        bam_sample_sex => undef,
+
+        # Reference sequence
         fa_ref => ']. $$self{fa_ref} .q[',
 
-        # mappability, obtained as described here https://github.com/rgcgithub/clamms
+        # Mappability, obtained as described here https://github.com/rgcgithub/clamms
+        # This is what worked for me:
+        #
+        #   gemtools index -i Homo_sapiens.GRCh38_15.fa -o genome.gem -t 20  # requires 9 GB, 3 hours
+        #   gem-mappability -I genome.gem -l 75 -o genome_75mer -T 20
+        #   gem-2-wig -I genome.gem -i genome_75mer.mappability -o genome_75mer
+        #   cat genome_75mer.wig | wig-to-bed | gzip -c > ../ref/mappability.b38.bed.gz
+        #
         mappability => ']. $$self{mappability} .q[',
 
         # bait regions, can be also given via the -r command line option
         baits => undef,
 
-        # number of samples in the reference panel
-        nref_smpl => ]. $$self{nref_smpl} .q[,
+        # Number of samples in the reference panel used to estimate typical read depth.
+        # The pipeline builds this panel separately for each sample, selecting those most similar
+        # to the current one.
 
-        # make insert size slightly bigger, for example, use 200 if the mean is ~150bp
+        # Make insert size slightly bigger, for example, use 200 if the mean is ~150bp
         isize  => ]. $$self{isize} .q[,
 
     ]."\n";
@@ -68,7 +79,7 @@ sub new
         "About: Run the CLAMMS pipeline\n" .
         "Usage: run-clamms\n" .
         "Options:\n" .
-        "   -b, --bam-sample-sex <file>     File with the list of bam\\tsex\n" .
+        "   -b, --bam-sample-sex <file>     File with the list of bam/cram\\tsample\\tsex(M/F)\n" .
         "   -o, --outdir <dir>              Output directory\n" .
         "   -r, --bait-regions <file>       BED file with bait regions\n" .
         "\n";
@@ -192,7 +203,7 @@ sub fix_resource_chr_naming
 
     if ( !$self->is_finished("$$self{outdir}/ref/mappability.bed") )
     {
-        $line = `head -1 $$self{mappability}`;
+        $line = `zless $$self{mappability} | head -1`;
         my $has_chr = $line=~/^chr/i ? 1 : 0;
         my $expr = '';
         if ( $ref_has_chr != $has_chr )
@@ -200,7 +211,7 @@ sub fix_resource_chr_naming
             $expr = $ref_has_chr ? 's,^,chr,' : 's,^chr,,';
             $expr = qq[ | sed '$expr' ];
         }
-        $self->cmd(qq[cat $$self{mappability} $expr | sort -k1,1d -k2,2n -k3,3n > $$self{outdir}/ref/mappability.bed.part && mv $$self{outdir}/ref/mappability.bed.part $$self{outdir}/ref/mappability.bed]);
+        $self->cmd(qq[zless $$self{mappability} $expr | sort -k1,1d -k2,2n -k3,3n > $$self{outdir}/ref/mappability.bed.part && mv $$self{outdir}/ref/mappability.bed.part $$self{outdir}/ref/mappability.bed]);
     }
     $$self{mappability} = "$$self{outdir}/ref/mappability.bed";
 

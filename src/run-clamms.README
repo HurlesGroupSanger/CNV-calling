@@ -50,17 +50,20 @@ How to run the CLAMMS pipeline
 
 
 
-3) How to run the run-clamms pipeline
+3) How to run the run-clamms pipeline. Some options can be overriden from the command line
 
-        run-clamms -o outdir/ -b bam-sex.txt -r exome_regions.txt +loop 300 +maxjobs 300 +mail pd3
+        run-clamms +config clamms.conf -o outdir/ -b bam-sex.txt +loop 300 +maxjobs 300 +mail pd3
 
    The meaning of the options:
+
+        +config clamms.conf
+            .. configurationo file with additional parameters, create the template as shown above
 
         -o outdir
             .. all the outputs will be placed here
 
         -b bam-sex.txt
-            .. list of BAMs and sexes, for example
+            .. list of BAMs/CRAMs and sexes, for example
                     /path/to/data/20150220/866STD86.bam M
                     /path/to/data/20150220/866STD88.bam F
 
@@ -71,9 +74,6 @@ How to run the CLAMMS pipeline
 
                If this is not desired because of permissions, just symlink the BAMs somwhere
                else and provide the symlink paths instead.
-
-        -r exome_regions.txt
-            .. the bait regions
 
         +loop 300
             .. tell the pipeline to check periodically (every 5 minutes) the running jobs.

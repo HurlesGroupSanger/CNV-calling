@@ -91,4 +91,20 @@ if [ "$has_samtools" -ne 0 ] || [ "$has_annot_tsv" -ne 0 ]; then
     echo 'export PATH='$dst_dir'/samtools-'$version'/htslib-'$version':$PATH' >> $dst_dir/setenv.sh
 fi
 
+# - clamms
+: "${CLAMMS_DIR:=clamms}"
+$CLAMMS_DIR/call_cnv >/dev/null 2>&1
+if [ "$?" != "1" ]; then
+    if [ ! -e $CLAMMS_DIR/call_cnv ]; then
+        git clone https://github.com/rgcgithub/clamms.git clamms.part
+        cd clamms.part
+        make
+        cd ..
+        mv clamms.part clamms
+    fi
+    echo "export CLAMMS_DIR=$dst_dir/clamms" > $dst_dir/setenv.sh
+fi
+
+
+
 
