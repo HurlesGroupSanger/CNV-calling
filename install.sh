@@ -124,4 +124,5 @@ if [ "$?" != "0" ]; then
     echo 'export PATH='$dst_dir'/xhmm:$PATH' >> $dst_dir/setenv.sh
 fi
 
+. $dst_dir/setenv.sh
 

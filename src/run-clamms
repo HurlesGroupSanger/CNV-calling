@@ -69,6 +69,7 @@ sub new
         # Number of samples in the reference panel used to estimate typical read depth.
         # The pipeline builds this panel separately for each sample, selecting those most similar
         # to the current one.
+        nref_smpl => ]. $$self{nref_smpl} .q[,
 
         # Make insert size slightly bigger, for example, use 200 if the mean is ~150bp
         isize  => ]. $$self{isize} .q[,
