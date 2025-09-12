@@ -46,7 +46,7 @@ pushd $dst_dir
 # - this CNV-calling pipeline
 set -e
 if [ $download_main = "1" ] && [ ! -e "CNV-calling" ]; then
-    git clone git@github.com:HurlesGroupSanger/CNV-calling.git
+    git clone --depth 1 git@github.com:HurlesGroupSanger/CNV-calling.git
 fi
 set +e
 
@@ -54,7 +54,7 @@ set +e
 perl -MRunner -e1 2>/dev/null
 if [ "$?" != "0" ]; then
     if [ ! -e vr-runner/modules ]; then
-        git clone git@github.com:VertebrateResequencing/vr-runner.git
+        git clone --depth 1 git@github.com:VertebrateResequencing/vr-runner.git
     fi
     echo 'export PATH='$dst_dir'/vr-runner/scripts:$PATH' >> $dst_dir/setenv.sh
     echo 'export PERL5LIB='$dst_dir'/vr-runner/modules:$PERL5LIB' >> $dst_dir/setenv.sh
@@ -64,7 +64,7 @@ fi
 run-convex +sampleconf 2>/dev/null
 if [ "$?" != "111" ]; then
     if [ ! -e CoNVex/utils/run-convex ]; then
-        git clone git@github.com:HurlesGroupSanger/CoNVex.git
+        git clone --depth 1 git@github.com:HurlesGroupSanger/CoNVex.git
     fi
     echo 'export PATH='$dst_dir'/CoNVex/utils:$PATH' >> $dst_dir/setenv.sh
 fi
@@ -96,15 +96,32 @@ fi
 $CLAMMS_DIR/call_cnv >/dev/null 2>&1
 if [ "$?" != "1" ]; then
     if [ ! -e $CLAMMS_DIR/call_cnv ]; then
-        git clone https://github.com/rgcgithub/clamms.git clamms.part
-        cd clamms.part
-        make
-        cd ..
+        git clone --depth 1 https://github.com/rgcgithub/clamms.git clamms.part
+        pushd clamms.part
+        set ee
+        make -j
+        set +e
+        popd
         mv clamms.part clamms
     fi
     echo "export CLAMMS_DIR=$dst_dir/clamms" > $dst_dir/setenv.sh
 fi
 
-
+# - xhmm
+xhmm --version >/dev/null 2>&1
+if [ "$?" != "0" ]; then
+    if [ ! -e xhmm/xhmm ]; then
+        git clone --depth 1 https://bitbucket.org/statgen/xhmm.git xhmm.part
+        pushd xhmm.part
+        set -e
+        # make it compile with newer versions of the compiler
+        sed -i.bak 's/^CXXFLAGS.*/CXXFLAGS = -std=c++11 -Wall -O3 $(DBGCXXFLAGS)/ ; s/^ALL_CFLAGS.*/ALL_CFLAGS = -std=c99 -O3 -DSQLITE_OMIT_LOAD_EXTENSION $(LIB_INCLUDE_FLAGS)/' ./sources/hmm++/config_defs.Makefile
+        make
+        set +e
+        popd
+        mv xhmm.part xhmm
+    fi
+    echo 'export PATH='$dst_dir'/xhmm:$PATH' >> $dst_dir/setenv.sh
+fi
 
 
