@@ -14,6 +14,13 @@ use warnings;
 use Carp;
 
 my $runner = myRunner->new();
+
+# Handle sample config generation early to avoid extra stdout noise
+if (grep { $_ eq '+sampleconf' } @ARGV) {
+    print $runner->{_sampleconf};
+    # Exit with DONE code (111) but without emitting additional stdout
+    exit 111;
+}
 $runner->run();
 
 exit;

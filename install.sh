@@ -104,10 +104,15 @@ if [ "$?" != "1" ]; then
         popd
         mv clamms.part clamms
     fi
-    echo "export CLAMMS_DIR=$dst_dir/clamms" > $dst_dir/setenv.sh
+    echo "export CLAMMS_DIR=$dst_dir/clamms" >> $dst_dir/setenv.sh
 fi
 
 # - xhmm
+#   Preflight: check for LAPACK/BLAS and warn if missing
+if ! ldconfig -p 2>/dev/null | grep -q liblapack; then
+    echo "Warning: LAPACK not found (liblapack). XHMM build may fail."
+    echo "         On Debian/Ubuntu install: sudo apt install -y liblapack-dev libblas-dev"
+fi
 xhmm --version >/dev/null 2>&1
 if [ "$?" != "0" ]; then
     if [ ! -e xhmm/xhmm ]; then
