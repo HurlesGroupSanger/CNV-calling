@@ -46,7 +46,7 @@ pushd $dst_dir
 # - this CNV-calling pipeline
 set -e
 if [ $download_main = "1" ] && [ ! -e "CNV-calling" ]; then
-    git clone --depth 1 git@github.com:HurlesGroupSanger/CNV-calling.git
+    git clone --depth 1 https://github.com/HurlesGroupSanger/CNV-calling.git
 fi
 set +e
 
@@ -54,7 +54,7 @@ set +e
 perl -MRunner -e1 2>/dev/null
 if [ "$?" != "0" ]; then
     if [ ! -e vr-runner/modules ]; then
-        git clone --depth 1 git@github.com:VertebrateResequencing/vr-runner.git
+        git clone --depth 1 https://github.com/VertebrateResequencing/vr-runner.git
     fi
     echo 'export PATH='$dst_dir'/vr-runner/scripts:$PATH' >> $dst_dir/setenv.sh
     echo 'export PERL5LIB='$dst_dir'/vr-runner/modules:$PERL5LIB' >> $dst_dir/setenv.sh
@@ -64,7 +64,7 @@ fi
 run-convex +sampleconf 2>/dev/null
 if [ "$?" != "111" ]; then
     if [ ! -e CoNVex/utils/run-convex ]; then
-        git clone --depth 1 git@github.com:HurlesGroupSanger/CoNVex.git
+        git clone --depth 1 https://github.com/HurlesGroupSanger/CoNVex.git
     fi
     echo 'export PATH='$dst_dir'/CoNVex/utils:$PATH' >> $dst_dir/setenv.sh
 fi
