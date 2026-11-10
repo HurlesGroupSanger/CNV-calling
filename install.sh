@@ -104,7 +104,7 @@ if [ "$?" != "1" ]; then
         popd
         mv clamms.part clamms
     fi
-    echo "export CLAMMS_DIR=$dst_dir/clamms" > $dst_dir/setenv.sh
+    echo "export CLAMMS_DIR=$dst_dir/clamms" >> $dst_dir/setenv.sh
 fi
 
 # - xhmm
