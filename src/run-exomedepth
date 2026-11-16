@@ -105,7 +105,7 @@ sub main
 
     for my $job (@$jobs)
     {
-        my $cmd = qq[$$self{samtools} bedcov -c $$self{baits} $$job{aln} | cut -f1-3,5 | gzip -c > $$job{bedcov}.part && mv $$job{bedcov}.part $$job{bedcov}];
+        my $cmd = qq[$$self{samtools} bedcov -c $$self{baits} $$job{aln} | awk 'BEGIN {OFS="\\t"} {print \$1,\$2,\$3,\$NF}' | gzip -c > $$job{bedcov}.part && mv $$job{bedcov}.part $$job{bedcov}];
         $self->spawn('run_cmd',$$job{bedcov},$cmd);
     }
     $self->wait;

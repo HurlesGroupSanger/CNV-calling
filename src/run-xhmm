@@ -362,7 +362,7 @@ sub merge_batches
 {
     my ($self,$outfile,$batches) = @_;
     my $txtfile = "$$self{outdir}/cnvs.txt.gz";
-    open(my $txt,"| gzip -c > $txtfile") or $self->throw("gzip -c > $txtfile.oart: $!");
+    open(my $txt,"| gzip -c > $txtfile.part") or $self->throw("gzip -c > $txtfile.part: $!");
     open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
     print $txt "#".join("\t",qw(chr beg end sample type qual))."\n";
     for (my $i=0; $i<@$batches; $i++)
@@ -386,7 +386,9 @@ sub merge_batches
         }
         close($in) or $self->throw("close failed: $$self{outdir}/batch/$i/DATA.xcnv");
     }
+    close($txt) or $self->throw("close failed: gzip -c > $txtfile.part");
     close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$txtfile.part",$txtfile) or $self->throw("rename $txtfile.part $txtfile: $!");
     rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile");
 }
 

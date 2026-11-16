@@ -125,7 +125,7 @@ sub main
 
     # Run picard BedToIntervalList and annotate_windows.sh
     $self->spawn('make_intervals',"$$self{baits}.intervals",$$self{baits});
-    $self->spawn('make_windows',$$self{wins},$$self{baits});
+    $self->spawn('make_windows',"$$self{wins}.bedcov",$$self{baits});
     $self->wait;
 
     # Run picard `CollectHsMetrics` and `samtools stats`
@@ -180,7 +180,9 @@ sub fix_resource_chr_naming
 {
     my ($self) = @_;
 
+    if ( !-r $$self{fa_ref} ) { $self->throw("Cannot read reference: $$self{fa_ref}"); }
     my $line = `zless $$self{fa_ref} | head -1`;
+    if ( !defined($line) or $line !~ /^>/ ) { $self->throw("Expected a FASTA header in $$self{fa_ref}"); }
     my $ref_has_chr = $line=~/^>chr/i ? 1 : 0;
 
     $self->cmd(qq[mkdir -p $$self{outdir}/ref]);
@@ -287,14 +289,18 @@ sub make_intervals
 sub make_windows
 {
     my ($self,$outfile,$baits) = @_;
-    $self->cmd(qq[$$self{clamms_dir}/annotate_windows.sh $baits $$self{fa_ref} $$self{mappability} $$self{isize} $$self{clamms_regs} | sed 's,chr,,g' > $outfile.part]);
+    $self->cmd(qq[/bin/bash -o pipefail $$self{clamms_dir}/annotate_windows.sh $baits $$self{fa_ref} $$self{mappability} $$self{isize} $$self{clamms_regs} > $outfile.part]);
+    if ( !-s "$outfile.part" ) { $self->throw("Window annotation produced no windows: $outfile.part"); }
+    # Preserve reference naming for bedcov, and use unprefixed names for CLAMMS.
+    $self->cmd(qq[sed 's,chr,,g' $outfile.part > $$self{wins}.part]);
+    rename("$$self{wins}.part",$$self{wins}) or $self->throw("rename $$self{wins}.part $$self{wins}: $!");
     rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
 }
 sub coverage
 {
     my ($self,$outfile,$job) = @_;
     my $bam = $self->stage_alignment($outfile,$$job{aln});
-    $self->cmd(qq[$$self{samtools} bedcov -Q 30 $$self{wins} $bam | awk '{printf "%s\\t%d\\t%d\\t%.6g\\n",\$1,\$2,\$3,\$NF/(\$3-\$2);}' > $outfile.raw]);
+    $self->cmd(qq[$$self{samtools} bedcov -Q 30 $$self{wins}.bedcov $bam | awk '{sub(/^chr/,"",\$1); printf "%s\\t%d\\t%d\\t%.6g\\n",\$1,\$2,\$3,\$NF/(\$3-\$2);}' > $outfile.raw]);
     $self->cmd(qq[$$self{clamms_dir}/normalize_coverage $outfile.raw $$self{wins} | sed 's,^chr,,' > $outfile.part]);
     $self->cmd(qq[gzip $outfile.raw]);
     if ( $bam ne $$job{aln} )
@@ -485,7 +491,7 @@ sub merge_cnvs
     if ( !($outfile=~/\.bed\.gz$/) ) { $self->throw("Uh, could not parse the filename: $outfile"); }
     my $txtfile = $`.'.txt.gz';
     my @failed = ();
-    open(my $txt,"| gzip -c > $txtfile") or $self->throw("gzip -c > $txtfile.part: $!");
+    open(my $txt,"| gzip -c > $txtfile.part") or $self->throw("gzip -c > $txtfile.part: $!");
     open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
     my @hdr = (qw(chr beg end interval sample type CN nWins Q_SOME Q_EXACT Q_LEFT_EXTEND LEFT_EXTEND_COORD Q_RIGHT_EXTEND RIGHT_EXTEND_COORD Q_LEFT_CONTRACT LEFT_CONTRACT_COORD Q_RIGHT_CONTRACT RIGHT_CONTRACT_COORD));
     print $out "#".join("\t",@hdr)."\n";
@@ -520,6 +526,7 @@ sub merge_cnvs
         close($out) or $self->throw("close failed: $$self{outdir}/failed.txt");
     }
 
+    rename("$txtfile.part",$txtfile) or $self->throw("rename $txtfile.part $txtfile: $!");
     rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
 }
 
