@@ -15,7 +15,9 @@ exit;
 #--------------------------------
 
 package myRunner;
-use base qw(Runner);
+use FindBin;
+use lib $FindBin::RealBin;
+use base qw(CNVRunner);
 use strict;
 use warnings;
 
@@ -27,6 +29,7 @@ sub new
     $$self{verbose}     = 1;
     $$self{rscript}     = 'Rscript';
     $$self{samtools}    = 'samtools';
+    $$self{iget}        = undef;
     $$self{fa_ref}      = 'ref.fa';
     $$self{baits}       = 'baits.txt';
     $$self{nbatch}      = 100;
@@ -43,6 +46,9 @@ sub new
 
         rscript  => ']. $$self{rscript} .q[',
         samtools => ']. $$self{samtools} .q[',
+
+        # If defined, fetch alignments from iRODS when not found locally
+        iget => undef,
 
         # Reference sequence
         fa_ref   => ']. $$self{fa_ref} .q[',
@@ -105,8 +111,7 @@ sub main
 
     for my $job (@$jobs)
     {
-        my $cmd = qq[$$self{samtools} bedcov -c $$self{baits} $$job{aln} | awk 'BEGIN {OFS="\\t"} {print \$1,\$2,\$3,\$NF}' | gzip -c > $$job{bedcov}.part && mv $$job{bedcov}.part $$job{bedcov}];
-        $self->spawn('run_cmd',$$job{bedcov},$cmd);
+        $self->spawn('coverage',$$job{bedcov},$job);
     }
     $self->wait;
 
@@ -151,6 +156,15 @@ sub run_cmd
 {
     my ($self,$outfile,$cmd) = @_;
     $self->cmd($cmd);
+}
+
+sub coverage
+{
+    my ($self,$outfile,$job) = @_;
+    my $bam = $self->stage_alignment($outfile,$$job{aln});
+    $self->cmd(qq[$$self{samtools} bedcov -c $$self{baits} $bam | awk 'BEGIN {OFS="\\t"} {print \$1,\$2,\$3,\$NF}' | gzip -c > $outfile.part]);
+    $self->clean_alignment($bam,$$job{aln});
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
 }
 
 sub unique_name

@@ -17,7 +17,9 @@ exit;
 #--------------------------------
 
 package myRunner;
-use base qw(Runner);
+use FindBin;
+use lib $FindBin::RealBin;
+use base qw(CNVRunner);
 use strict;
 use warnings;
 
@@ -128,24 +130,17 @@ sub main
     $self->spawn('make_windows',"$$self{wins}.bedcov",$$self{baits});
     $self->wait;
 
-    # Run picard `CollectHsMetrics` and `samtools stats`
+    # Run metrics and coverage together, fetching each remote alignment once.
     $self->set_limits(memory=>3_500);
     for my $job (@$jobs)
     {
-        $self->spawn('hs_metrics',$$job{metrics},$job);
+        $self->spawn('sample_metrics',"$$job{metrics}.done",$job);
     }
     $self->wait;
     $self->set_limits(memory=>undef);
 
     # Select reference panels using the k-d tree
     $self->spawn('select_ref_panels',"$$self{outdir}/ref-panels",$jobs);
-    $self->wait;
-
-    # Run `samtools bedcov`
-    for my $job (@$jobs)
-    {
-        $self->spawn('coverage',$$job{bedcov},$job);
-    }
     $self->wait;
 
     for my $job (@$jobs)
@@ -298,43 +293,34 @@ sub make_windows
 }
 sub coverage
 {
-    my ($self,$outfile,$job) = @_;
-    my $bam = $self->stage_alignment($outfile,$$job{aln});
+    my ($self,$outfile,$job,$bam) = @_;
+    my $staged = !defined($bam);
+    if ( $staged ) { $bam = $self->stage_alignment($outfile,$$job{aln}); }
     $self->cmd(qq[$$self{samtools} bedcov -Q 30 $$self{wins}.bedcov $bam | awk '{sub(/^chr/,"",\$1); printf "%s\\t%d\\t%d\\t%.6g\\n",\$1,\$2,\$3,\$NF/(\$3-\$2);}' > $outfile.raw]);
     $self->cmd(qq[$$self{clamms_dir}/normalize_coverage $outfile.raw $$self{wins} | sed 's,^chr,,' > $outfile.part]);
     $self->cmd(qq[gzip $outfile.raw]);
-    if ( $bam ne $$job{aln} )
-    {
-        unlink($bam);
-        unlink("$bam.crai");
-        unlink("$bam.bai");
-    }
+    if ( $staged ) { $self->clean_alignment($bam,$$job{aln}); }
     rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
 }
-sub stage_alignment
+sub sample_metrics
 {
-    my ($self,$outfile,$aln) = @_;
-    if ( -e $aln or !defined($$self{iget}) ) { return $aln; }
-    if ( !($aln =~ /\.(bam|cram)$/i) ) { $self->throw("Expected a BAM or CRAM file: $aln"); }
-    my $suffix = lc($1);
-    my $bam = "$outfile.$suffix";
-    my $index = $suffix eq 'cram' ? 'crai' : 'bai';
-    $self->cmd(qq[command -v $$self{iget} >/dev/null]);
-    $self->cmd(qq[$$self{iget} -f $aln $bam.part && mv $bam.part $bam]);
-    # An index may not be stored in iRODS; build one if retrieval fails.
-    unlink("$bam.$index");
-    $self->cmd(qq[$$self{iget} -f $aln.$index $bam.$index.part && mv $bam.$index.part $bam.$index],exit_on_error=>0);
-    if ( !-e "$bam.$index" )
+    my ($self,$outfile,$job) = @_;
+    my $metrics = !-s $$job{metrics} || !-s $$job{stats};
+    my $coverage = !-s $$job{bedcov};
+    if ( $metrics or $coverage )
     {
-        unlink("$bam.$index.part");
-        $self->cmd(qq[$$self{samtools} index $bam]);
+        my $bam = $self->stage_alignment($$job{metrics},$$job{aln});
+        if ( $metrics ) { $self->hs_metrics($$job{metrics},$job,$bam); }
+        if ( $coverage ) { $self->coverage($$job{bedcov},$job,$bam); }
+        $self->clean_alignment($bam,$$job{aln});
     }
-    return $bam;
+    $self->cmd(qq[touch $outfile]);
 }
 sub hs_metrics
 {
-    my ($self,$outfile,$job) = @_;
-    my $bam = $self->stage_alignment($outfile,$$job{aln});
+    my ($self,$outfile,$job,$bam) = @_;
+    my $staged = !defined($bam);
+    if ( $staged ) { $bam = $self->stage_alignment($outfile,$$job{aln}); }
     $self->cmd(qq[$$self{picard} CollectHsMetrics -VALIDATION_STRINGENCY SILENT -R $$self{fa_ref} -I $bam -O $outfile.part -BI $$self{baits}.intervals -TI $$self{baits}.intervals],java_err_file=>"$outfile.java_log");
     unlink("$outfile.java_log");
     unlink("$outfile.java_log.prev");
@@ -342,12 +328,7 @@ sub hs_metrics
     $self->cmd("$$self{samtools} stats $bam > $$job{stats}.part");
     rename("$$job{stats}.part",$$job{stats}) or $self->throw("rename $$job{stats}.part $$job{stats}: $!");
 
-    if ( $bam ne $$job{aln} )
-    {
-        unlink($bam);
-        unlink("$bam.crai");
-        unlink("$bam.bai");
-    }
+    if ( $staged ) { $self->clean_alignment($bam,$$job{aln}); }
     rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
 }
 sub merge_metrics

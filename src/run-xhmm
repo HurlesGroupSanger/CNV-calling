@@ -21,7 +21,9 @@ exit;
 #--------------------------------
 
 package myRunner;
-use base qw(Runner);
+use FindBin;
+use lib $FindBin::RealBin;
+use base qw(CNVRunner);
 use strict;
 use warnings;
 
@@ -37,6 +39,8 @@ sub new
     $$self{xhmm_params} = 'params.txt';
     $$self{xhmm_r}      = 'R_functions';
     $$self{rscript}     = 'Rscript';
+    $$self{samtools}    = 'samtools';
+    $$self{iget}        = undef;
     $$self{fa_ref}      = 'ref.fa';
     $$self{baits}       = 'baits.txt';
     $$self{nbatch}      = 100;
@@ -47,6 +51,12 @@ sub new
         xhmm     => ']. $$self{xhmm} .q[',
         xhmm_r   => ']. $$self{xhmm_r} .q[',
         xhmm_params => ']. $$self{xhmm_params} .q[',
+
+        # Used to index alignments fetched from iRODS
+        samtools => ']. $$self{samtools} .q[',
+
+        # If defined, fetch alignments from iRODS when not found locally
+        iget => undef,
 
         # Reference sequence
         fa_ref   => ']. $$self{fa_ref} .q[',
@@ -136,16 +146,7 @@ sub main
     $self->set_limits(%{$$self{gatk_depth_limits}}) unless !exists($$self{gatk_depth_limits});
     for my $job (@$jobs)
     {
-        my $outfile = $$job{depth};
-        my $cmd =
-            qq[$$self{gatk} DepthOfCoverage -L $$self{outdir}/baits.txt.interval_list -R $$self{fa_ref} -I $$job{aln}] .
-            qq[ --max-depth-per-sample 5000 --omit-depth-output-at-each-base true --omit-locus-table true] .
-            qq[ --min-base-quality 20 --start 1 --stop 500 --nBins 200] .
-            qq[ --include-ref-n-sites true -imr OVERLAPPING_ONLY] .
-            qq[ --count-type COUNT_READS] .
-            qq[ --output-format TABLE] .
-            qq[ -O $outfile];
-        $self->spawn('run_cmd',$outfile,qq[$cmd && mv $outfile.sample_interval_summary $outfile]);
+        $self->spawn('depth',$$job{depth},$job);
     }
     $self->wait;
     $self->reset_limits(%limits);
@@ -174,6 +175,24 @@ sub run_cmd
 {
     my ($self,$outfile,$cmd) = @_;
     $self->cmd($cmd);
+}
+
+sub depth
+{
+    my ($self,$outfile,$job) = @_;
+    my $bam = $self->stage_alignment($outfile,$$job{aln});
+    my $cmd =
+        qq[$$self{gatk} DepthOfCoverage -L $$self{outdir}/baits.txt.interval_list -R $$self{fa_ref} -I $bam] .
+        qq[ --max-depth-per-sample 5000 --omit-depth-output-at-each-base true --omit-locus-table true] .
+        qq[ --min-base-quality 20 --start 1 --stop 500 --nBins 200] .
+        qq[ --include-ref-n-sites true -imr OVERLAPPING_ONLY] .
+        qq[ --count-type COUNT_READS] .
+        qq[ --output-format TABLE] .
+        qq[ -O $outfile.part];
+    $self->cmd($cmd);
+    if ( !-s "$outfile.part.sample_interval_summary" ) { $self->throw("GATK produced no interval summary: $outfile.part.sample_interval_summary"); }
+    $self->clean_alignment($bam,$$job{aln});
+    rename("$outfile.part.sample_interval_summary",$outfile) or $self->throw("rename $outfile.part.sample_interval_summary $outfile: $!");
 }
 
 sub unique_name
