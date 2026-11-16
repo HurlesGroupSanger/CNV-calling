@@ -6,12 +6,17 @@ Suggested usage:
    ```
    wget -qO- \
    https://raw.githubusercontent.com/HurlesGroupSanger/cnv-calling/refs/heads/main/install.sh | bash -s install_dir
-   
+
    # set the paths: either add to your profile or execute before running the pipelines below
    . install_dir/setenv.sh
    ```
 
-2. Run the CNV callers
+2. Run the CNV callers. In each config, set all commands and paths
+   to reference files and indexes, bait regions, etc. as appropriate.
+
+   Runner defaults to an LSF cluster. Add `+local` to run serially without a
+   scheduler, or `+js slurm` to use SLURM.
+
    ```
    # Create a config file, edit it, then run the pipeline
    run-clamms +sampleconf > run-clamms.conf
@@ -22,7 +27,7 @@ Suggested usage:
    # edit run-xhmm.conf
    run-xhmm   +config run-xhmm.conf   -o out.xhmm   -b ref/bam-sex.txt
 
-   run-exomedepth +sampleconfig > run-exomedepth.conf
+   run-exomedepth +sampleconf > run-exomedepth.conf
    # edit run-exomedepth.conf
    run-exomedepth +config run-exomedepth.conf -o out.exomedepth -b ref/bam-sample-sex.txt
 
